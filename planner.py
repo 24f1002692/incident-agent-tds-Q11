@@ -3,8 +3,23 @@ import json
 import requests
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-GEMINI_MODEL = "gemini-2.0-flash"
-GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+
+# Try these models in order — fallback to next if one fails (quota, 429, etc.)
+# Lite/flash variants first since they have higher free-tier rate limits.
+GEMINI_MODELS = [
+    "gemini-2.0-flash-lite",
+    "gemini-1.5-flash-8b",
+    "gemini-2.0-flash",
+    "gemini-1.5-flash",
+    "gemini-1.5-flash-002",
+    "gemini-2.5-flash-lite",
+    "gemini-2.5-flash",
+    "gemini-1.5-pro",
+    "gemini-1.5-flash-latest",
+    "gemini-1.5-pro-latest",
+]
+
+GEMINI_URL_TEMPLATE = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 
 
 def _extract_json(text: str) -> dict:
@@ -17,9 +32,39 @@ def _extract_json(text: str) -> dict:
     return json.loads(text.strip())
 
 
+def _call_gemini(model: str, prompt: str) -> str:
+    """Calls a single Gemini model. Raises on any HTTP error."""
+    url = GEMINI_URL_TEMPLATE.format(model=model)
+    resp = requests.post(
+        f"{url}?key={GEMINI_API_KEY}",
+        json={
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {"temperature": 0, "responseMimeType": "application/json"},
+        },
+        timeout=15,
+    )
+    if resp.status_code != 200:
+        raise RuntimeError(f"{model} returned {resp.status_code}: {resp.text[:300]}")
+    data = resp.json()
+    return data["candidates"][0]["content"]["parts"][0]["text"]
+
+
+def _call_with_fallback(prompt: str) -> str:
+    """Tries each model in GEMINI_MODELS in order until one succeeds."""
+    last_error = None
+    for model in GEMINI_MODELS:
+        try:
+            return _call_gemini(model, prompt)
+        except Exception as e:
+            last_error = e
+            continue
+    raise RuntimeError(f"All Gemini models failed. Last error: {last_error}")
+
+
 def plan(transcript: str, allowed_root_causes: list, tool_catalog: list, max_diagnostics: int = 3) -> dict:
     """
-    Single model call: diagnoses the root cause AND selects diagnostic tool calls.
+    Single model call (with model fallback): diagnoses the root cause
+    AND selects diagnostic tool calls.
     Returns:
       {
         "rootCause": "...",
@@ -63,17 +108,7 @@ Rules:
 - Do not invent tool names not in the catalog.
 """
 
-    resp = requests.post(
-        f"{GEMINI_URL}?key={GEMINI_API_KEY}",
-        json={
-            "contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {"temperature": 0, "responseMimeType": "application/json"},
-        },
-        timeout=15,
-    )
-    resp.raise_for_status()
-    data = resp.json()
-    text = data["candidates"][0]["content"]["parts"][0]["text"]
+    text = _call_with_fallback(prompt)
     parsed = _extract_json(text)
 
     # --- Validate & sanitize ---
