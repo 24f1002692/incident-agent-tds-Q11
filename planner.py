@@ -4,19 +4,14 @@ import requests
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
-# Try these models in order — fallback to next if one fails (quota, 429, etc.)
-# Lite/flash variants first since they have higher free-tier rate limits.
+# Current (July 2026) valid Gemini models — old 1.5/2.0 series is shut down.
+# Lite/flash variants first for higher free-tier rate limits.
 GEMINI_MODELS = [
-    "gemini-2.0-flash-lite",
-    "gemini-1.5-flash-8b",
-    "gemini-2.0-flash",
-    "gemini-1.5-flash",
-    "gemini-1.5-flash-002",
     "gemini-2.5-flash-lite",
+    "gemini-3.5-flash-lite",
     "gemini-2.5-flash",
-    "gemini-1.5-pro",
-    "gemini-1.5-flash-latest",
-    "gemini-1.5-pro-latest",
+    "gemini-3.6-flash",
+    "gemini-2.5-pro",
 ]
 
 GEMINI_URL_TEMPLATE = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
@@ -51,28 +46,20 @@ def _call_gemini(model: str, prompt: str) -> str:
 
 def _call_with_fallback(prompt: str) -> str:
     """Tries each model in GEMINI_MODELS in order until one succeeds."""
-    last_error = None
+    errors = []
     for model in GEMINI_MODELS:
         try:
             return _call_gemini(model, prompt)
         except Exception as e:
-            last_error = e
+            errors.append(str(e))
             continue
-    raise RuntimeError(f"All Gemini models failed. Last error: {last_error}")
+    raise RuntimeError("All Gemini models failed:\n" + "\n".join(errors))
 
 
 def plan(transcript: str, allowed_root_causes: list, tool_catalog: list, max_diagnostics: int = 3) -> dict:
     """
     Single model call (with model fallback): diagnoses the root cause
     AND selects diagnostic tool calls.
-    Returns:
-      {
-        "rootCause": "...",
-        "evidence": ["ev_x", "ev_y"],
-        "diagnosticCalls": [
-          {"toolName": "...", "arguments": {...}, "evidence": ["ev_x"]}
-        ]
-      }
     """
     tool_summaries = []
     for t in tool_catalog:
@@ -111,7 +98,6 @@ Rules:
     text = _call_with_fallback(prompt)
     parsed = _extract_json(text)
 
-    # --- Validate & sanitize ---
     root_cause = parsed.get("rootCause")
     if root_cause not in allowed_root_causes:
         root_cause = allowed_root_causes[0] if allowed_root_causes else "unknown"
