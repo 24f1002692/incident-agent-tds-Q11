@@ -4,7 +4,8 @@ from digest import arguments_digest
 
 
 def process_receipt(run, body):
-    """Applies grader outcomes/approvals from a receipt body, then advances state."""
+    receipt_id = body.get("receiptId")
+
     for o in body.get("outcomes", []):
         entry = ActionLogEntry.query.filter_by(
             run_id=run.run_id,
@@ -17,12 +18,17 @@ def process_receipt(run, body):
             continue  # not a pending call — ignore per spec
 
         status = o.get("status")
+        entry.observed_status = status
+        entry.receipt_id = receipt_id
+        entry.receipt_nonce = o.get("nonce")
+
         if status == 503 and entry.attempt == 1:
             entry.status = "retried"
+            entry.error_type = "503"
             retry_entry = ActionLogEntry(
                 run_id=run.run_id,
                 action_id=entry.action_id,
-                call_id=new_opaque_id(),
+                call_id=entry.call_id,  # SAME callId — only span/attempt changes on retry
                 phase=entry.phase,
                 tool_name=entry.tool_name,
                 arguments=entry.arguments,
@@ -35,11 +41,14 @@ def process_receipt(run, body):
             db.session.add(retry_entry)
         elif status == 0 and o.get("errorType") == "timeout":
             entry.status = "failed"
+            entry.error_type = "timeout"
         elif status == 200:
             entry.status = "succeeded"
             entry.result_class = o.get("resultClass")
+            entry.error_type = None
         else:
             entry.status = "failed"
+            entry.error_type = str(status)
 
     db.session.commit()
 
@@ -56,11 +65,10 @@ def process_receipt(run, body):
 
 
 def advance(run):
-    """Pure state-machine step: no model calls, only DB reads/writes."""
     diagnostics = ActionLogEntry.query.filter_by(run_id=run.run_id, phase="diagnostic").all()
 
     if any(e.status == "pending" for e in diagnostics):
-        return  # still waiting on diagnostic outcomes
+        return
 
     if any(e.status == "failed" for e in diagnostics):
         run.status = "failed"
@@ -82,7 +90,7 @@ def advance(run):
         elif any(e.status == "failed" for e in effect_entries):
             run.status = "failed"
             db.session.commit()
-        return  # else still waiting on effect outcome
+        return
 
     is_destructive = run.chosen_effect_tool in (run.approval_required_for or [])
 
@@ -103,7 +111,7 @@ def advance(run):
             )
             db.session.add(appr)
             db.session.commit()
-            return  # wait for approval
+            return
         elif approval.status == "approved":
             entry = ActionLogEntry(
                 run_id=run.run_id,
@@ -125,7 +133,7 @@ def advance(run):
             db.session.commit()
             return
         else:
-            return  # still pending approval
+            return
     else:
         entry = ActionLogEntry(
             run_id=run.run_id,
