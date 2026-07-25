@@ -40,11 +40,12 @@ def _call_gemini(model: str, prompt: str) -> str:
     return data["candidates"][0]["content"]["parts"][0]["text"]
 
 
-def _call_with_fallback(prompt: str) -> str:
+def _call_with_fallback(prompt: str):
+    """Returns (text, model_name_used)."""
     errors = []
     for model in GEMINI_MODELS:
         try:
-            return _call_gemini(model, prompt)
+            return _call_gemini(model, prompt), model
         except Exception as e:
             errors.append(str(e))
             continue
@@ -53,15 +54,6 @@ def _call_with_fallback(prompt: str) -> str:
 
 def plan(transcript: str, allowed_root_causes: list, tool_catalog: list,
          effect_tools: list, max_diagnostics: int = 3) -> dict:
-    """
-    ONE model call: diagnosis + diagnostic tool calls + chosen recovery effect.
-    Returns:
-      {
-        "rootCause": "...", "evidence": [...],
-        "diagnosticCalls": [{"toolName":..., "arguments":..., "evidence":[...]}],
-        "chosenEffect": {"toolName": "...", "arguments": {...}} | None
-      }
-    """
     diag_tools = [t for t in tool_catalog if t.get("name") not in effect_tools]
     eff_tools = [t for t in tool_catalog if t.get("name") in effect_tools]
 
@@ -99,7 +91,7 @@ Rules:
 - Do not invent tool names not in the catalogs given.
 """
 
-    text = _call_with_fallback(prompt)
+    text, model_used = _call_with_fallback(prompt)
     parsed = _extract_json(text)
 
     root_cause = parsed.get("rootCause")
@@ -146,4 +138,5 @@ Rules:
         "evidence": evidence,
         "diagnosticCalls": clean_calls,
         "chosenEffect": chosen_effect,
+        "modelUsed": model_used,
     }
