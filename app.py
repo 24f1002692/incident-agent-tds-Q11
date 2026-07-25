@@ -1,6 +1,7 @@
 from flask import Flask, request, jsonify
 import os
 import hashlib
+from sqlalchemy import text
 
 from models import db, IncidentRun, ActionLogEntry, ReceiptEntry, ApprovalEntry
 from ids import new_opaque_id, new_trace_id, new_span_id, build_traceparent, parse_traceparent
@@ -15,6 +16,23 @@ db.init_app(app)
 
 with app.app_context():
     db.create_all()
+    migration_statements = [
+        "ALTER TABLE incident_run ADD COLUMN IF NOT EXISTS approval_required_for JSON",
+        "ALTER TABLE incident_run ADD COLUMN IF NOT EXISTS chosen_effect_tool VARCHAR",
+        "ALTER TABLE incident_run ADD COLUMN IF NOT EXISTS chosen_effect_arguments JSON",
+        "ALTER TABLE incident_run ADD COLUMN IF NOT EXISTS effect_dispatched BOOLEAN DEFAULT FALSE",
+        "ALTER TABLE incident_run ADD COLUMN IF NOT EXISTS model_used VARCHAR",
+        "ALTER TABLE action_log_entry ADD COLUMN IF NOT EXISTS observed_status INTEGER",
+        "ALTER TABLE action_log_entry ADD COLUMN IF NOT EXISTS error_type VARCHAR",
+        "ALTER TABLE action_log_entry ADD COLUMN IF NOT EXISTS receipt_id VARCHAR",
+        "ALTER TABLE action_log_entry ADD COLUMN IF NOT EXISTS receipt_nonce VARCHAR",
+    ]
+    for stmt in migration_statements:
+        try:
+            db.session.execute(text(stmt))
+            db.session.commit()
+        except Exception:
+            db.session.rollback()
 
 SUPPORTED_PROFILE = "ga5-incident-agent/v2"
 
@@ -174,7 +192,6 @@ def create_incident():
         db.session.add(entry)
     db.session.commit()
 
-    # If there were no diagnostics needed, advance immediately (may dispatch effect directly)
     if not plan_result["diagnosticCalls"]:
         state_machine.advance(run)
 
@@ -209,10 +226,8 @@ def post_receipt(run_id):
         else:
             return error("receiptId exists with different content", 409)
 
-    # Apply the outcomes/approvals to the state machine first.
     state_machine.process_receipt(run, body)
 
-    # Save the receipt BEFORE building the response, so it's reflected in receiptLog.
     entry = ReceiptEntry(
         run_id=run_id,
         receipt_id=receipt_id,
