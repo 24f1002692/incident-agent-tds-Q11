@@ -1,7 +1,6 @@
 from flask import Flask, request, jsonify
 import os
 import hashlib
-import json
 
 from models import db, IncidentRun, ActionLogEntry, ReceiptEntry, ApprovalEntry
 from ids import new_opaque_id, new_trace_id
@@ -16,94 +15,102 @@ db.init_app(app)
 with app.app_context():
     db.create_all()
 
-PUBLIC_MARKER = os.environ.get("PUBLIC_MARKER", "ga5-run")
+SUPPORTED_PROFILE = "ga5-incident-agent/v2"
+
+
+def error(msg, code):
+    return jsonify({"error": msg}), code
 
 
 @app.route("/v2/incidents", methods=["POST"])
 def create_incident():
     body = request.get_json(silent=True)
-    if not body or "transcript" not in body:
-        return jsonify({"error": "invalid request"}), 400
+    if not isinstance(body, dict):
+        return error("invalid json body", 400)
 
-    transcript = body["transcript"]
+    # --- Validate top-level shape ---
+    if body.get("profile") != SUPPORTED_PROFILE:
+        return error("unsupported profile", 422)
+
+    run_id = body.get("runId")
+    if not run_id or not isinstance(run_id, str) or len(run_id) < 8:
+        return error("missing or invalid runId", 400)
+
+    incident = body.get("incident")
+    if not isinstance(incident, dict) or "transcript" not in incident or "allowedRootCauses" not in incident:
+        return error("invalid incident object", 400)
+
+    transcript = incident["transcript"]
+    allowed_root_causes = incident["allowedRootCauses"]
+    tool_catalog = body.get("toolCatalog", [])
+    policy = body.get("policy", {})
+    public_marker = body.get("publicMarker", "")
+    # sensitive object must NEVER be forwarded to the model or stored in any exported field
+    # (we simply never read body["sensitive"] beyond this point)
+
+    content_hash = hashlib.sha256(
+        canonical_json({
+            "runId": run_id,
+            "incident": incident,
+            "toolCatalog": tool_catalog,
+            "policy": policy,
+        }).encode()
+    ).hexdigest()
+
+    # --- Idempotency / conflict check ---
+    existing = IncidentRun.query.get(run_id)
+    if existing:
+        if existing.request_hash == content_hash:
+            # identical replay -> return stored state, no recompute, no model call
+            return jsonify(redact(build_incident_response(existing))), 200
+        else:
+            return error("runId exists with different content", 409)
+
+    # --- New run: do the real (or stub) diagnosis ---
     incoming_tp = request.headers.get("traceparent")
+    trace_id = new_trace_id()  # TODO: continue incoming_tp's trace_id if valid (Step 5)
 
-    run_id = new_opaque_id()
-    trace_id = new_trace_id()
-
-    # STEP 4 TODO: replace with real planner.diagnose() call
-    diagnosis = planner.diagnose(transcript, evidence_lines=transcript.splitlines())
+    diagnosis = planner.diagnose(
+        transcript=transcript,
+        allowed_root_causes=allowed_root_causes,
+        evidence_lines=transcript.splitlines(),
+    )
 
     run = IncidentRun(
         run_id=run_id,
         status="waiting",
-        request_hash=hashlib.sha256(canonical_json(body).encode()).hexdigest(),
+        request_hash=content_hash,
         trace_id=trace_id,
-        public_marker=PUBLIC_MARKER,
+        public_marker=public_marker,
         diagnosis_root_cause=diagnosis["rootCause"],
         diagnosis_evidence=diagnosis["evidence"],
     )
     db.session.add(run)
     db.session.commit()
 
-    response = {
-        "runId": run_id,
-        "status": "waiting",
-        "diagnosis": {"rootCause": diagnosis["rootCause"], "evidence": diagnosis["evidence"]},
-        "dispatches": [],
-        "approvals": [],
-    }
-    return jsonify(redact(response)), 200
+    # TODO Step 5: generate real diagnostic dispatches here instead of []
+    return jsonify(redact(build_incident_response(run))), 200
 
 
-@app.route("/v2/incidents/<run_id>", methods=["GET"])
-def get_incident(run_id):
-    run = IncidentRun.query.get(run_id)
-    if not run:
-        return jsonify({"error": "not found"}), 404
-
-    response = {
+def build_incident_response(run):
+    resp = {
         "runId": run.run_id,
         "status": run.status,
-        "diagnosis": {"rootCause": run.diagnosis_root_cause, "evidence": run.diagnosis_evidence},
+        "diagnosis": {
+            "rootCause": run.diagnosis_root_cause,
+            "evidence": run.diagnosis_evidence,
+        },
     }
-    return jsonify(redact(response)), 200
+    if run.status == "waiting":
+        resp["dispatches"] = []   # TODO: populate from ActionLogEntry pending rows
+        resp["approvals"] = []    # TODO: populate from ApprovalEntry pending rows
+    else:
+        resp["chosenEffect"] = run.chosen_effect
+        resp["suppressed"] = run.suppressed or []
+        resp["actionLog"] = []    # TODO Step 9
+        resp["receiptLog"] = []   # TODO Step 9
+        resp["otlp"] = otlp_builder.build_otlp(run, [], [])  # TODO Step 10
+    return resp
 
 
-@app.route("/v2/incidents/<run_id>/receipts", methods=["POST"])
-def post_receipt(run_id):
-    run = IncidentRun.query.get(run_id)
-    if not run:
-        return jsonify({"error": "not found"}), 404
-
-    body = request.get_json(silent=True)
-    if not body or "receiptId" not in body:
-        return jsonify({"error": "invalid receipt"}), 400
-
-    receipt_id = body["receiptId"]
-    body_hash = hashlib.sha256(canonical_json(body).encode()).hexdigest()
-
-    existing = ReceiptEntry.query.filter_by(receipt_id=receipt_id).first()
-    if existing:
-        if existing.body_hash == body_hash:
-            return jsonify(redact(existing.response_snapshot)), 200
-        else:
-            return jsonify({"error": "conflict"}), 409
-
-    # TODO Step 6-8: real state_machine.advance() call here
-    response = {"runId": run.run_id, "status": run.status}
-
-    entry = ReceiptEntry(
-        run_id=run_id,
-        receipt_id=receipt_id,
-        body_hash=body_hash,
-        response_snapshot=response,
-    )
-    db.session.add(entry)
-    db.session.commit()
-
-    return jsonify(redact(response)), 200
-
-
-if __name__ == "__main__":
-    app.run(debug=True, port=5000)
+@app.route("/v2/incidents/<run_id>", methods=
