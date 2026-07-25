@@ -208,17 +208,22 @@ def post_receipt(run_id):
         else:
             return error("receiptId exists with different content", 409)
 
+    # Apply the outcomes/approvals to the state machine first.
     state_machine.process_receipt(run, body)
-    response = build_incident_response(run)
 
+    # Save the receipt BEFORE building the response, so it's reflected in receiptLog.
     entry = ReceiptEntry(
         run_id=run_id,
         receipt_id=receipt_id,
         body_hash=body_hash,
         body_snapshot=body,
-        response_snapshot=response,
+        response_snapshot=None,
     )
     db.session.add(entry)
+    db.session.commit()
+
+    response = build_incident_response(run)
+    entry.response_snapshot = response
     db.session.commit()
 
     return jsonify(redact(response)), 200
