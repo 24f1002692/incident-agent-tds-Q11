@@ -152,6 +152,7 @@ def create_incident():
         approval_required_for=approval_required_for,
         chosen_effect_tool=plan_result["chosenEffect"]["toolName"] if plan_result["chosenEffect"] else None,
         chosen_effect_arguments=plan_result["chosenEffect"]["arguments"] if plan_result["chosenEffect"] else None,
+        model_used=plan_result.get("modelUsed"),
     )
     db.session.add(run)
     db.session.commit()
