@@ -18,6 +18,7 @@ class IncidentRun(db.Model):
     chosen_effect_tool = db.Column(db.String, nullable=True)
     chosen_effect_arguments = db.Column(db.JSON, nullable=True)
     effect_dispatched = db.Column(db.Boolean, default=False)
+    model_used = db.Column(db.String, nullable=True)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
 
@@ -38,6 +39,10 @@ class ActionLogEntry(db.Model):
     result_class = db.Column(db.String, nullable=True)
     approval_id = db.Column(db.String, nullable=True)
     approval_nonce = db.Column(db.String, nullable=True)
+    observed_status = db.Column(db.Integer, nullable=True)   # 200 / 503 / 0(timeout) etc
+    error_type = db.Column(db.String, nullable=True)         # "503" | "timeout" | None
+    receipt_id = db.Column(db.String, nullable=True)         # which receipt delivered this outcome
+    receipt_nonce = db.Column(db.String, nullable=True)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
 
