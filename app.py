@@ -6,6 +6,7 @@ from models import db, IncidentRun, ActionLogEntry, ReceiptEntry, ApprovalEntry
 from ids import new_opaque_id, new_trace_id, new_span_id, build_traceparent, parse_traceparent
 from digest import canonical_json, redact
 import planner
+import state_machine
 import otlp as otlp_builder
 
 app = Flask(__name__)
@@ -43,16 +44,49 @@ def build_incident_response(run):
                 "evidence": e.evidence,
                 "attempt": e.attempt,
                 "traceparent": build_traceparent(e.trace_id, e.span_id),
+                **({"approvalId": e.approval_id, "approvalNonce": e.approval_nonce} if e.approval_id else {}),
             }
             for e in pending
         ]
-        resp["approvals"] = []  # TODO Step 8
+        pending_approvals = ApprovalEntry.query.filter_by(run_id=run.run_id, status="pending").all()
+        resp["approvals"] = [
+            {
+                "approvalId": a.approval_id,
+                "actionId": a.action_id,
+                "toolName": a.tool_name,
+                "argumentsDigest": a.arguments_digest,
+            }
+            for a in pending_approvals
+        ]
     else:
         resp["chosenEffect"] = run.chosen_effect
         resp["suppressed"] = run.suppressed or []
-        resp["actionLog"] = []   # TODO Step 9
-        resp["receiptLog"] = []  # TODO Step 9
-        resp["otlp"] = otlp_builder.build_otlp(run, [], [])  # TODO Step 10
+        all_actions = ActionLogEntry.query.filter_by(run_id=run.run_id).order_by(ActionLogEntry.id).all()
+        resp["actionLog"] = [
+            {
+                "actionId": e.action_id, "callId": e.call_id, "phase": e.phase,
+                "toolName": e.tool_name, "arguments": e.arguments, "evidence": e.evidence,
+                "attempt": e.attempt, "traceparent": build_traceparent(e.trace_id, e.span_id),
+            }
+            for e in all_actions
+        ]
+        all_receipts = ReceiptEntry.query.filter_by(run_id=run.run_id).order_by(ReceiptEntry.id).all()
+        receipt_log = []
+        for r in all_receipts:
+            body = r.body_snapshot or {}
+            for o in body.get("outcomes", []):
+                receipt_log.append({
+                    "receiptId": r.receipt_id, "actionId": o.get("actionId"), "callId": o.get("callId"),
+                    "attempt": o.get("attempt"), "status": o.get("status"),
+                    "resultClass": o.get("resultClass"), "nonce": o.get("nonce"),
+                })
+            for a in body.get("approvals", []):
+                receipt_log.append({
+                    "receiptId": r.receipt_id, "approvalId": a.get("approvalId"),
+                    "decision": a.get("decision"), "nonce": a.get("nonce"),
+                })
+        resp["receiptLog"] = receipt_log
+        resp["otlp"] = otlp_builder.build_otlp(run, all_actions, all_receipts)
     return resp
 
 
@@ -78,14 +112,13 @@ def create_incident():
     tool_catalog = body.get("toolCatalog", [])
     policy = body.get("policy", {})
     public_marker = body.get("publicMarker", "")
-    # NOTE: body.get("sensitive") is intentionally never read beyond this point.
+    effect_tools = policy.get("effectTools", [])
+    approval_required_for = policy.get("approvalRequiredFor", [])
 
     content_hash = hashlib.sha256(
         canonical_json({
-            "runId": run_id,
-            "incident": incident,
-            "toolCatalog": tool_catalog,
-            "policy": policy,
+            "runId": run_id, "incident": incident,
+            "toolCatalog": tool_catalog, "policy": policy,
         }).encode()
     ).hexdigest()
 
@@ -100,11 +133,11 @@ def create_incident():
     parsed_incoming = parse_traceparent(incoming_tp) if incoming_tp else None
     trace_id = parsed_incoming[0] if parsed_incoming else new_trace_id()
 
-    # --- Single model call: diagnosis + diagnostic tool selection ---
-    diagnosis_plan = planner.plan(
+    plan_result = planner.plan(
         transcript=transcript,
         allowed_root_causes=allowed_root_causes,
         tool_catalog=tool_catalog,
+        effect_tools=effect_tools,
         max_diagnostics=policy.get("maximumDiagnostics", 3),
     )
 
@@ -114,34 +147,35 @@ def create_incident():
         request_hash=content_hash,
         trace_id=trace_id,
         public_marker=public_marker,
-        diagnosis_root_cause=diagnosis_plan["rootCause"],
-        diagnosis_evidence=diagnosis_plan["evidence"],
+        diagnosis_root_cause=plan_result["rootCause"],
+        diagnosis_evidence=plan_result["evidence"],
+        approval_required_for=approval_required_for,
+        chosen_effect_tool=plan_result["chosenEffect"]["toolName"] if plan_result["chosenEffect"] else None,
+        chosen_effect_arguments=plan_result["chosenEffect"]["arguments"] if plan_result["chosenEffect"] else None,
     )
     db.session.add(run)
     db.session.commit()
 
-    # --- Generate real diagnostic dispatches from the plan ---
-    for call in diagnosis_plan["diagnosticCalls"]:
-        action_id = new_opaque_id()
-        call_id = new_opaque_id()
-        span_id = new_span_id()
-
+    for call in plan_result["diagnosticCalls"]:
         entry = ActionLogEntry(
             run_id=run_id,
-            action_id=action_id,
-            call_id=call_id,
+            action_id=new_opaque_id(),
+            call_id=new_opaque_id(),
             phase="diagnostic",
             tool_name=call["toolName"],
             arguments=call["arguments"],
             evidence=call["evidence"],
             attempt=1,
             trace_id=trace_id,
-            span_id=span_id,
+            span_id=new_span_id(),
             status="pending",
         )
         db.session.add(entry)
-
     db.session.commit()
+
+    # If there were no diagnostics needed, advance immediately (may dispatch effect directly)
+    if not plan_result["diagnosticCalls"]:
+        state_machine.advance(run)
 
     return jsonify(redact(build_incident_response(run))), 200
 
@@ -174,13 +208,14 @@ def post_receipt(run_id):
         else:
             return error("receiptId exists with different content", 409)
 
-    # TODO Step 6-8: real state_machine.advance() call here
+    state_machine.process_receipt(run, body)
     response = build_incident_response(run)
 
     entry = ReceiptEntry(
         run_id=run_id,
         receipt_id=receipt_id,
         body_hash=body_hash,
+        body_snapshot=body,
         response_snapshot=response,
     )
     db.session.add(entry)
