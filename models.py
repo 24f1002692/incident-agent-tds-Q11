@@ -6,7 +6,7 @@ db = SQLAlchemy()
 class IncidentRun(db.Model):
     __tablename__ = "incident_run"
     run_id = db.Column(db.String, primary_key=True)
-    status = db.Column(db.String, default="waiting")  # waiting | completed | failed
+    status = db.Column(db.String, default="waiting")
     request_hash = db.Column(db.String)
     trace_id = db.Column(db.String)
     public_marker = db.Column(db.String)
@@ -14,7 +14,12 @@ class IncidentRun(db.Model):
     diagnosis_evidence = db.Column(db.JSON)
     chosen_effect = db.Column(db.String, nullable=True)
     suppressed = db.Column(db.JSON, default=list)
+    approval_required_for = db.Column(db.JSON, default=list)
+    chosen_effect_tool = db.Column(db.String, nullable=True)
+    chosen_effect_arguments = db.Column(db.JSON, nullable=True)
+    effect_dispatched = db.Column(db.Boolean, default=False)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
 
 class ActionLogEntry(db.Model):
     __tablename__ = "action_log_entry"
@@ -29,11 +34,12 @@ class ActionLogEntry(db.Model):
     attempt = db.Column(db.Integer, default=1)
     trace_id = db.Column(db.String)
     span_id = db.Column(db.String)
-    status = db.Column(db.String, default="pending")  # pending|succeeded|failed
+    status = db.Column(db.String, default="pending")  # pending|succeeded|failed|retried
     result_class = db.Column(db.String, nullable=True)
     approval_id = db.Column(db.String, nullable=True)
     approval_nonce = db.Column(db.String, nullable=True)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
 
 class ReceiptEntry(db.Model):
     __tablename__ = "receipt_entry"
@@ -41,8 +47,10 @@ class ReceiptEntry(db.Model):
     run_id = db.Column(db.String)
     receipt_id = db.Column(db.String, unique=True)
     body_hash = db.Column(db.String)
-    response_snapshot = db.Column(db.JSON)  # cached response for replay
+    body_snapshot = db.Column(db.JSON)
+    response_snapshot = db.Column(db.JSON)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
 
 class ApprovalEntry(db.Model):
     __tablename__ = "approval_entry"
